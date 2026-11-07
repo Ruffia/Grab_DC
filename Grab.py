@@ -5,6 +5,7 @@ import tushare as ts
 ts.set_token("c37889408c22e87e788a7388c75c99bc9b1fc56d3e1f8bb77cf264ae")   # 或直接 ts.set_token("你的token")
 pro = ts.pro_api()
 
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
@@ -33,8 +34,8 @@ pro = ts.pro_api()
     FundFlow_MediumOrder     <- buy_md_amount     今日中单净流入额
     FundFlow_SmallOrder      <- buy_sm_amount     今日小单净流入额
 
-数值处理：所有金额、价格、涨跌幅统一保留 1 位小数（四舍五入 ROUND_HALF_UP），
-          NULL 仍写 NULL。
+数值处理：Price、Rise 保留 2 位小数；其余 5 个资金流字段保留 1 位小数
+          （四舍五入 ROUND_HALF_UP），NULL 仍写 NULL。
 
 用法：
     python stock_moneyflow_dc_to_db.py                  # 最近 15 个交易日，全市场
@@ -60,8 +61,10 @@ import tushare as ts
 TOKEN = os.getenv("TUSHARE_TOKEN", "")
 SLEEP = 0.35                    # 逐日请求间隔
 TABLE = "IndividualFundFlow_DC"
-DECIMALS = 1                    # 保留 1 位小数
-_QUANT = Decimal("0.1")         # 与 DECIMALS 对应
+PRICE_DECIMALS = 2              # Price、Rise 保留 2 位小数
+FLOW_DECIMALS = 1               # 5 个资金流字段保留 1 位小数
+_Q_PRICE = Decimal("0.01")      # 与 PRICE_DECIMALS 对应
+_Q_FLOW = Decimal("0.1")        # 与 FLOW_DECIMALS 对应
 
 # 表必须包含的字段（用于启动时校验）
 REQUIRED_COLUMNS = [
@@ -229,8 +232,8 @@ def check_table(conn: sqlite3.Connection) -> None:
         print("[信息] 表结构校验通过：10 个字段齐全，7 个数值列均为 REAL")
 
 
-def _num(value):
-    """数值 -> 保留 1 位小数的 float（四舍五入）；None / NaN / 非数字 -> None。"""
+def _num(value, quant):
+    """数值 -> 按 quant 指定的位数四舍五入；None / NaN / 非数字 -> None。"""
     if value is None:
         return None
     try:
@@ -239,7 +242,8 @@ def _num(value):
         return None
     if math.isnan(f) or math.isinf(f):
         return None
-    return float(Decimal(str(f)).quantize(_QUANT, rounding=ROUND_HALF_UP))
+    v = float(Decimal(str(f)).quantize(quant, rounding=ROUND_HALF_UP))
+    return v + 0.0                          # -0.0 归一成 0.0
 
 
 def to_rows(df: pd.DataFrame) -> list:
@@ -250,13 +254,13 @@ def to_rows(df: pd.DataFrame) -> list:
             to_db_date(rec.trade_date),
             rec.ts_code,
             rec.name,
-            _num(rec.close),            # Price
-            _num(rec.pct_change),       # Rise
-            _num(rec.net_amount),       # FundFlow_MainForce
-            _num(rec.buy_elg_amount),   # FundFlow_SuperLargeOrder
-            _num(rec.buy_lg_amount),    # FundFlow_LargeOrder
-            _num(rec.buy_md_amount),    # FundFlow_MediumOrder
-            _num(rec.buy_sm_amount),    # FundFlow_SmallOrder
+            _num(rec.close, _Q_PRICE),           # Price        2 位小数
+            _num(rec.pct_change, _Q_PRICE),      # Rise         2 位小数
+            _num(rec.net_amount, _Q_FLOW),       # FundFlow_MainForce       1 位小数
+            _num(rec.buy_elg_amount, _Q_FLOW),   # FundFlow_SuperLargeOrder 1 位小数
+            _num(rec.buy_lg_amount, _Q_FLOW),    # FundFlow_LargeOrder      1 位小数
+            _num(rec.buy_md_amount, _Q_FLOW),    # FundFlow_MediumOrder     1 位小数
+            _num(rec.buy_sm_amount, _Q_FLOW),    # FundFlow_SmallOrder      1 位小数
         ))
     return rows
 
@@ -330,8 +334,8 @@ def main(argv=None) -> int:
             return 0
 
         rows = to_rows(raw)
-        print(f"\n待写入 {len(rows)} 行（数值保留 {DECIMALS} 位小数），"
-              f"数据库：{os.path.abspath(args.db)}")
+        print(f"\n待写入 {len(rows)} 行（价格/涨幅 {PRICE_DECIMALS} 位小数，"
+              f"资金流 {FLOW_DECIMALS} 位小数），数据库：{os.path.abspath(args.db)}")
 
         # -------- 入库 --------
         changed = upsert(conn, rows)
