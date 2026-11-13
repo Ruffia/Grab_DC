@@ -12,15 +12,20 @@ pro = ts.pro_api()
 全市场个股资金流 -> SQLite 数据库 Tip.IndividualFundFlow_DC（表已存在，只写数据）
 ================================================================================
 
-前提：数据库与 IndividualFundFlow_DC 表已经建好（脚本不再执行 DDL，只做字段校验）。
+前提：数据库与 IndividualFundFlow_DC 表已经建好（脚本不执行 DDL，只做字段校验）。
+
+取数天数从数据库的 Settings 表读取：
+    CREATE TABLE "Settings" (
+      "ItemName"  TEXT NOT NULL,
+      "ItemValue" TEXT,
+      "Description" TEXT,
+      PRIMARY KEY ("ItemName")
+    );
+    例如：INSERT INTO "Settings" VALUES ('Days', '15', '获取多少天(交易日)的资金流数据');
+优先级：命令行 --days > Settings 表的 Days 项 > 默认 15 天。
+Settings 表不存在、没有 Days 项或值非法时，退回默认 15 天并给出提示。
 
 数据源：Tushare Pro  moneyflow_dc（东方财富口径，需 5000 积分，数据自 2023-09-11）
-表结构（与已有表一致）：
-    TradeDate DATE, StockCode TEXT, StockName TEXT, Price real, Rise real,
-    FundFlow_MainForce real, FundFlow_SuperLargeOrder real, FundFlow_LargeOrder real,
-    FundFlow_MediumOrder real, FundFlow_SmallOrder real,
-    PRIMARY KEY(TradeDate, StockCode)
-    说明：7 个数值列全部为 REAL，入库后可直接参与比较、排序、SUM/AVG。
 
 字段对应关系：
     TradeDate                <- trade_date        （转成 YYYY-MM-DD）
@@ -38,11 +43,11 @@ pro = ts.pro_api()
           （四舍五入 ROUND_HALF_UP），NULL 仍写 NULL。
 
 用法：
-    python stock_moneyflow_dc_to_db.py                  # 最近 15 个交易日，全市场
-    python stock_moneyflow_dc_to_db.py --days 5
-    python stock_moneyflow_dc_to_db.py --date 20241101
+    python stock_moneyflow_dc_to_db.py                  # 天数按 Settings 表来
+    python stock_moneyflow_dc_to_db.py --days 5         # 临时覆盖 Settings.Days
+    python stock_moneyflow_dc_to_db.py --date 20241101  # 只看某一天
     python stock_moneyflow_dc_to_db.py --start 20241101 --end 20241115
-    python stock_moneyflow_dc_to_db.py --db "Tip.db"
+    python stock_moneyflow_dc_to_db.py --db "U:\\Grab\\Tip.db"
 
 依赖：pip install tushare pandas
 """
@@ -61,6 +66,8 @@ import tushare as ts
 TOKEN = os.getenv("TUSHARE_TOKEN", "")
 SLEEP = 0.35                    # 逐日请求间隔
 TABLE = "IndividualFundFlow_DC"
+SETTINGS_TABLE = "Settings"     # 配置表：ItemName / ItemValue
+DEFAULT_DAYS = 15               # Settings 缺失时的兜底天数
 PRICE_DECIMALS = 2              # Price、Rise 保留 2 位小数
 FLOW_DECIMALS = 1               # 5 个资金流字段保留 1 位小数
 _Q_PRICE = Decimal("0.01")      # 与 PRICE_DECIMALS 对应
@@ -155,11 +162,23 @@ def get_trade_days(pro, start_date: str, end_date: str) -> list:
 
 
 def recent_trade_days(pro, days: int, end_date: str = None) -> list:
-    """最近 days 个交易日（升序），默认以今天为终点。"""
+    """
+    最近 days 个交易日（升序），默认以今天为终点。
+
+    先放宽日历区间查出交易日，再截取最后 days 个；区间不够（春节、
+    国庆长假）时自动扩大窗口重查，保证数量刚好是 days。
+    """
     end = norm_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
-    span = days * 2 + 10                       # 交易日约占日历日 2/3，留冗余
-    start = (datetime.strptime(end, "%Y%m%d") - timedelta(days=span)).strftime("%Y%m%d")
-    return get_trade_days(pro, start, end)
+    end_dt = datetime.strptime(end, "%Y%m%d")
+
+    all_days = []
+    for span in (days * 2 + 10, days * 4 + 30, days * 6 + 90):
+        start = (end_dt - timedelta(days=span)).strftime("%Y%m%d")
+        all_days = get_trade_days(pro, start, end)
+        if len(all_days) >= days:
+            break
+
+    return all_days[-days:]
 
 
 def fetch_one_day(pro, trade_date: str) -> pd.DataFrame:
@@ -202,7 +221,7 @@ def fetch_days(pro, dates: list) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
-# 数据库
+# 数据库 / 配置
 # --------------------------------------------------------------------------- #
 def connect(db_path: str) -> sqlite3.Connection:
     """连接已有数据库（不会建库建表）。"""
@@ -232,6 +251,52 @@ def check_table(conn: sqlite3.Connection) -> None:
         print("[信息] 表结构校验通过：10 个字段齐全，7 个数值列均为 REAL")
 
 
+def read_setting(conn: sqlite3.Connection, name: str):
+    """从 Settings 表读一个配置项；表不存在 / 没有该项 / 值为空，都返回 None。"""
+    try:
+        row = conn.execute(
+            f'SELECT "ItemValue" FROM "{SETTINGS_TABLE}" '
+            f'WHERE "ItemName" = ? COLLATE NOCASE', (name,)
+        ).fetchone()
+    except sqlite3.Error:                     # 表不存在
+        return None
+    if not row or row[0] is None:
+        return None
+    value = str(row[0]).strip()
+    return value or None
+
+
+def resolve_days(conn: sqlite3.Connection, cli_days):
+    """
+    取数天数优先级：命令行 --days > Settings.Days > DEFAULT_DAYS。
+    返回 (天数, 来源说明)。
+    """
+    if cli_days is not None:
+        if int(cli_days) <= 0:
+            raise SystemExit(f"--days 必须是正整数，收到：{cli_days}")
+        return int(cli_days), "命令行 --days"
+
+    raw = read_setting(conn, "Days")
+    if raw is None:
+        print(f"[提醒] Settings 表里没有 Days 项（或表不存在），使用默认 {DEFAULT_DAYS} 天")
+        return DEFAULT_DAYS, "默认值"
+
+    try:
+        days = int(float(raw))
+    except ValueError:
+        print(f'[提醒] Settings.Days = "{raw}" 不是有效数字，使用默认 {DEFAULT_DAYS} 天')
+        return DEFAULT_DAYS, "默认值"
+
+    if days <= 0:
+        print(f'[提醒] Settings.Days = "{raw}" 不是正整数，使用默认 {DEFAULT_DAYS} 天')
+        return DEFAULT_DAYS, "默认值"
+
+    return days, f'Settings.Days = "{raw}"'
+
+
+# --------------------------------------------------------------------------- #
+# 加工 / 入库
+# --------------------------------------------------------------------------- #
 def _num(value, quant):
     """数值 -> 按 quant 指定的位数四舍五入；None / NaN / 非数字 -> None。"""
     if value is None:
@@ -296,10 +361,11 @@ def report(conn: sqlite3.Connection, dates: list) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="全市场个股资金流入库（moneyflow_dc -> SQLite）")
     p.add_argument("--db", default="Tip.db", help="数据库文件，默认 Tip.db")
-    p.add_argument("--days", type=int, default=15, help="最近多少个交易日，默认 15")
+    p.add_argument("--days", type=int, default=None,
+                   help="临时覆盖 Settings 表的 Days 项；不传则读 Settings")
     p.add_argument("--date", default=None, help="只取某一天，如 20241101")
     p.add_argument("--start", default=None, help="区间开始日")
-    p.add_argument("--end", default=None, help="区间结束日（也用作 --days 的截止日）")
+    p.add_argument("--end", default=None, help="区间结束日（也用作天数的截止日）")
     p.add_argument("--token", default=None, help="Tushare token")
     return p
 
@@ -321,7 +387,9 @@ def main(argv=None) -> int:
                 print("[提示] 区间内没有交易日")
                 return 0
         else:
-            dates = recent_trade_days(pro, args.days, args.end)
+            days, source = resolve_days(conn, args.days)
+            print(f"[信息] 取数天数：{days}（来源：{source}）")
+            dates = recent_trade_days(pro, days, args.end)
             if not dates:
                 print("[提示] 未取到交易日，请检查日期范围")
                 return 0
