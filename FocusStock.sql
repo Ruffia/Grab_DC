@@ -10,7 +10,7 @@
  Target Server Version : 3045000 (3.45.0)
  File Encoding         : 65001
 
- Date: 07/11/2026 10:31:41
+ Date: 14/11/2026 17:57:25
 */
 
 PRAGMA foreign_keys = false;
@@ -23,6 +23,7 @@ CREATE TABLE "FocusStock" (
   "FocusDate" DATE NOT NULL,
   "StockCode" TEXT NOT NULL,
   "StockName" TEXT,
+  "FocusType" integer DEFAULT 0,
   PRIMARY KEY ("FocusDate", "StockCode")
 );
 

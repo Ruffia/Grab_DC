@@ -10,7 +10,7 @@
  Target Server Version : 3045000 (3.45.0)
  File Encoding         : 65001
 
- Date: 13/11/2026 21:18:05
+ Date: 14/11/2026 16:07:34
 */
 
 PRAGMA foreign_keys = false;
@@ -30,5 +30,7 @@ CREATE TABLE "Settings" (
 -- Records of Settings
 -- ----------------------------
 INSERT INTO "Settings" VALUES ('Days', '3', '获取多少天(交易日)的资金流数据');
+INSERT INTO "Settings" VALUES ('DeltaPercent', '2.0', '净流入资金占近期最高值的百分比');
+INSERT INTO "Settings" VALUES ('DeltaDays', '20', '统计多少天(交易日)的资金流数据');
 
 PRAGMA foreign_keys = true;
