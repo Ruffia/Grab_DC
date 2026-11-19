@@ -23,7 +23,6 @@ pro = ts.pro_api()
     );
     例如：INSERT INTO "Settings" VALUES ('Days', '15', '获取多少天(交易日)的资金流数据');
 优先级：命令行 --days > Settings 表的 Days 项 > 默认 15 天。
-Settings 表不存在、没有 Days 项或值非法时，退回默认 15 天并给出提示。
 
 数据源：Tushare Pro  moneyflow_dc（东方财富口径，需 5000 积分，数据自 2023-09-11）
 
@@ -39,15 +38,21 @@ Settings 表不存在、没有 Days 项或值非法时，退回默认 15 天并�
     FundFlow_MediumOrder     <- buy_md_amount     今日中单净流入额
     FundFlow_SmallOrder      <- buy_sm_amount     今日小单净流入额
 
+完整性校验（重要）：
+    Tushare 当日数据是「逐步放量」的，收盘后可能先只有几百行。
+    写库前会和表内上一个交易日比行数，低于 90% 视为未更新完：
+      - 默认【不写库】，退出码 2，提示稍后重跑；
+      - 加 --allow-partial 可强制写入（补数据时用）。
+
 数值处理：Price、Rise 保留 2 位小数；其余 5 个资金流字段保留 1 位小数
           （四舍五入 ROUND_HALF_UP），NULL 仍写 NULL。
 
 用法：
-    python stock_moneyflow_dc_to_db.py                  # 天数按 Settings 表来
-    python stock_moneyflow_dc_to_db.py --days 5         # 临时覆盖 Settings.Days
-    python stock_moneyflow_dc_to_db.py --date 20241101  # 只看某一天
-    python stock_moneyflow_dc_to_db.py --start 20241101 --end 20241115
-    python stock_moneyflow_dc_to_db.py --db "U:\\Grab\\Tip.db"
+    python Grab.py                  # 天数按 Settings 表来
+    python Grab.py --days 5         # 临时覆盖 Settings.Days
+    python Grab.py --date 20241101  # 只看某一天
+    python Grab.py --start 20241101 --end 20241115
+    python Grab.py --allow-partial  # 数据没更新完也写
 
 依赖：pip install tushare pandas
 """
@@ -56,6 +61,7 @@ import argparse
 import math
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -65,13 +71,19 @@ import tushare as ts
 
 TOKEN = os.getenv("TUSHARE_TOKEN", "")
 SLEEP = 0.35                    # 逐日请求间隔
+DB_PATH = r"U:\Grab\Tip.db"     # 默认数据库（可用 --db 覆盖）
 TABLE = "IndividualFundFlow_DC"
 SETTINGS_TABLE = "Settings"     # 配置表：ItemName / ItemValue
 DEFAULT_DAYS = 15               # Settings 缺失时的兜底天数
 PRICE_DECIMALS = 2              # Price、Rise 保留 2 位小数
 FLOW_DECIMALS = 1               # 5 个资金流字段保留 1 位小数
+PARTIAL_RATIO = 0.90            # 当日行数 / 上一交易日行数 低于该比例视为未更新完
 _Q_PRICE = Decimal("0.01")      # 与 PRICE_DECIMALS 对应
 _Q_FLOW = Decimal("0.1")        # 与 FLOW_DECIMALS 对应
+
+API_RETRIES = 4                 # 接口异常（502/网关错误）时的重试次数
+API_WAIT = 8                    # 每次重试间隔（秒）
+EMPTY_TOLERANCE = 5             # 连续多少个交易日返回空就判定为接口异常
 
 # 表必须包含的字段（用于启动时校验）
 REQUIRED_COLUMNS = [
@@ -134,31 +146,83 @@ def to_db_date(yyyymmdd: str) -> str:
     return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
 
 
+def is_api_down(df) -> bool:
+    """
+    判断返回值是否代表「接口异常」而不是「当天没有数据」。
+
+    Tushare 服务端 502 / 网关故障时，tushare 库不抛异常，而是返回 0 行 0 列的空表；
+    正常的「当天无数据」会带着完整字段名返回空表。
+    """
+    return df is None or (df.empty and len(df.columns) == 0)
+
+
+def api_down_error(detail: str) -> SystemExit:
+    """接口不可用时给出可执行的排查提示，而不是抛 KeyError。"""
+    return SystemExit(
+        f"Tushare 接口无有效响应：{detail}\n"
+        f"已重试 {API_RETRIES} 次（间隔 {API_WAIT}s）。常见原因：\n"
+        "  1) Tushare 服务端故障（502 Bad Gateway），过几分钟再跑即可；\n"
+        "  2) 本机网络 / 代理拦截，可访问 http://api.tushare.pro 验证；\n"
+        "  3) 该接口积分不足（trade_cal 需 2000 分，moneyflow_dc 需 5000 分）。")
+
+
 def call_dc(pro, **kwargs) -> pd.DataFrame:
-    """调用 moneyflow_dc，处理频率限制与积分不足。"""
+    """调用 moneyflow_dc，处理频率限制、积分不足与服务端 502。"""
     params = {k: v for k, v in kwargs.items() if v is not None}
-    last_exc = None
-    for attempt in range(3):
+    last_msg = ""
+    for attempt in range(1, API_RETRIES + 1):
         try:
             df = pro.moneyflow_dc(**params)
-            return df if df is not None else pd.DataFrame()
         except Exception as exc:
-            last_exc = exc
-            msg = str(exc)
-            if "每分钟" in msg:
+            last_msg = str(exc)
+            if "每分钟" in last_msg:
                 time.sleep(61)
                 continue
-            if "权限" in msg or "积分" in msg:
-                raise SystemExit(f"moneyflow_dc 调用失败（需 5000 积分）：{msg}")
-            time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"moneyflow_dc 调用失败：{last_exc}")
+            if "权限" in last_msg or "积分" in last_msg:
+                raise SystemExit(f"moneyflow_dc 调用失败（需 5000 积分）：{last_msg}")
+            print(f"[警告] 第 {attempt}/{API_RETRIES} 次请求失败：{last_msg[:100]}", file=sys.stderr)
+            time.sleep(API_WAIT)
+            continue
+
+        if is_api_down(df):
+            last_msg = "返回 0 行 0 列（疑似服务端 502 或网关错误）"
+            print(f"[警告] 第 {attempt}/{API_RETRIES} 次请求异常：{last_msg}", file=sys.stderr)
+            time.sleep(API_WAIT)
+            continue
+        return df
+
+    raise api_down_error(f"moneyflow_dc {params} 连续 {API_RETRIES} 次失败，最后一次：{last_msg}")
 
 
 def get_trade_days(pro, start_date: str, end_date: str) -> list:
-    """区间内的交易日（升序）。"""
-    cal = pro.trade_cal(exchange="SSE", start_date=start_date, end_date=end_date,
-                        fields="cal_date,is_open")
-    return sorted(cal.loc[cal["is_open"].astype(int) == 1, "cal_date"].astype(str))
+    """
+    区间内的交易日（升序）。
+
+    trade_cal 可能因服务端 502 返回空表，这里显式校验字段并重试，
+    避免直接抛 KeyError: 'is_open' 这种误导性错误。
+    """
+    last_msg = ""
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            cal = pro.trade_cal(exchange="SSE", start_date=start_date, end_date=end_date,
+                                fields="cal_date,is_open")
+        except Exception as exc:
+            cal = None
+            last_msg = str(exc)
+
+        if cal is not None and "is_open" in cal.columns and not cal.empty:
+            return sorted(cal.loc[cal["is_open"].astype(int) == 1, "cal_date"].astype(str))
+
+        if cal is not None and "is_open" in cal.columns:
+            return []                       # 字段正常但区间内无交易日
+        last_msg = last_msg or "trade_cal 返回 0 行 0 列（疑似服务端 502）"
+        print(f"[警告] 第 {attempt}/{API_RETRIES} 次获取交易日历失败：{last_msg[:100]}",
+              file=sys.stderr)
+        if attempt < API_RETRIES:
+            time.sleep(API_WAIT)
+
+    raise api_down_error(f"trade_cal {start_date}~{end_date} 连续 {API_RETRIES} 次失败，"
+                         f"最后一次：{last_msg}")
 
 
 def recent_trade_days(pro, days: int, end_date: str = None) -> list:
@@ -198,14 +262,20 @@ def fetch_days(pro, dates: list) -> pd.DataFrame:
     candidates = get_trade_days(pro, probe_start, dates[-1])
     pool = [d for d in candidates if d < dates[0]] + dates
 
-    frames, got = [], 0
+    frames, got, misses = [], 0, 0
     for day in reversed(pool):                  # 从最新往前取
         if got >= len(dates):
             break
         df = fetch_one_day(pro, day)
         if df.empty:
+            misses += 1
             print(f"  {day} 无数据（未更新或非交易日），跳过并向前补一天")
+            if misses >= EMPTY_TOLERANCE:
+                raise SystemExit(
+                    f"连续 {misses} 个交易日都返回空表，接口多半异常（服务端 502 或积分不足），"
+                    "已中止以免反复空转。请先用 trade_cal 自检后重试。")
         else:
+            misses = 0
             frames.append(df)
             got += 1
         print(f"\r  已取 {got}/{len(dates)} 个交易日  当前 {day}", end="", flush=True)
@@ -330,11 +400,62 @@ def to_rows(df: pd.DataFrame) -> list:
     return rows
 
 
-def upsert(conn: sqlite3.Connection, rows: list) -> int:
-    """在一个事务里批量写入，返回受影响行数。"""
+def check_completeness(conn: sqlite3.Connection, df: pd.DataFrame,
+                       allow_partial: bool = False) -> bool:
+    """
+    写库前的完整性校验：当日行数 vs 表内上一个交易日行数。
+
+    Tushare 当日资金流是逐步放量的（例如 19:30 只有 606 行，而前一交易日有 6035 行），
+    低于 PARTIAL_RATIO 视为「还没更新完」，默认拒绝写入。
+    """
+    if df.empty:
+        return True
+
+    dates = sorted(df["trade_date"].astype(str).unique())
+    latest = dates[-1]
+    today_n = int((df["trade_date"].astype(str) == latest).sum())
+
+    row = conn.execute(
+        f'SELECT "TradeDate", COUNT(*) FROM "{TABLE}" WHERE "TradeDate" < ? '
+        f'GROUP BY 1 ORDER BY 1 DESC LIMIT 1', (to_db_date(latest),)).fetchone()
+    if not row or not row[1]:
+        return True                          # 表里还没有历史，无从比较
+
+    prev_day, prev_n = row[0], int(row[1])
+    ratio = today_n / prev_n
+    if ratio >= PARTIAL_RATIO:
+        return True
+
+    print(f"[警告] {to_db_date(latest)} 只取到 {today_n} 行，"
+          f"上一交易日 {prev_day} 有 {prev_n} 行（仅 {ratio:.0%}），数据源多半尚未更新完。")
+    if allow_partial:
+        print("[提示] 已指定 --allow-partial，按现有数据写入。")
+        return True
+
+    print("[中止] 未写入数据库。等数据更新完后重跑；确实要写半成品请加 --allow-partial。")
+    return False
+
+
+def upsert(conn: sqlite3.Connection, rows: list, batch: int = 500) -> int:
+    """分批写同一个事务，每 batch 条打印一次进度。"""
+    total = len(rows)
+    if total == 0:
+        return 0
     before = conn.total_changes
+    done, tty, t0 = 0, sys.stdout.isatty(), time.time()
     with conn:                                  # 成功自动 commit，异常自动 rollback
-        conn.executemany(UPSERT, rows)
+        for i in range(0, total, batch):
+            chunk = rows[i:i + batch]
+            conn.executemany(UPSERT, chunk)
+            done += len(chunk)
+            msg = (f"[入库] {done}/{total} 行（{done * 100.0 / total:5.1f}%），"
+                   f"耗时 {time.time() - t0:.1f}s")
+            if tty:
+                print(f"\r{msg}", end="", flush=True)
+            else:
+                print(msg, flush=True)
+    if tty:
+        print()
     return conn.total_changes - before
 
 
@@ -360,13 +481,15 @@ def report(conn: sqlite3.Connection, dates: list) -> None:
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="全市场个股资金流入库（moneyflow_dc -> SQLite）")
-    p.add_argument("--db", default="Tip.db", help="数据库文件，默认 Tip.db")
+    p.add_argument("--db", default=DB_PATH, help=f"数据库文件，默认 {DB_PATH}")
     p.add_argument("--days", type=int, default=None,
                    help="临时覆盖 Settings 表的 Days 项；不传则读 Settings")
     p.add_argument("--date", default=None, help="只取某一天，如 20241101")
     p.add_argument("--start", default=None, help="区间开始日")
     p.add_argument("--end", default=None, help="区间结束日（也用作天数的截止日）")
     p.add_argument("--token", default=None, help="Tushare token")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="数据明显不全时仍然写入（默认不写）")
     return p
 
 
@@ -400,6 +523,10 @@ def main(argv=None) -> int:
         if raw.empty:
             print("[提示] 接口返回空：可能是非交易日，或数据尚未更新")
             return 0
+
+        # -------- 完整性校验（数据没更新完就不写库） --------
+        if not check_completeness(conn, raw, args.allow_partial):
+            return 2
 
         rows = to_rows(raw)
         print(f"\n待写入 {len(rows)} 行（价格/涨幅 {PRICE_DECIMALS} 位小数，"
